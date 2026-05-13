@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>YT Stream Resolver</title>
+    <style>
+      :root { color-scheme: dark; }
+      body {
+        margin: 0; min-height: 100vh; display: grid; place-items: center;
+        font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+        background: radial-gradient(1200px 600px at 20% 0%, #1f2937, #0b0f17 60%);
+        color: #e5e7eb;
+      }
+      .card {
+        width: min(720px, 92vw); padding: 28px;
+        background: rgba(17,24,39,.7); border: 1px solid #1f2937;
+        border-radius: 16px; backdrop-filter: blur(8px);
+        box-shadow: 0 20px 60px rgba(0,0,0,.4);
+      }
+      h1 { margin: 0 0 4px; font-size: 22px; }
+      p.sub { margin: 0 0 20px; color: #9ca3af; font-size: 14px; }
+      .row { display: flex; gap: 8px; }
+      input, button {
+        font: inherit; padding: 12px 14px; border-radius: 10px; border: 1px solid #374151;
+        background: #0b1220; color: #e5e7eb;
+      }
+      input { flex: 1; }
+      button { background: #2563eb; border-color: #2563eb; cursor: pointer; }
+      button:disabled { opacity: .6; cursor: progress; }
+      .result { margin-top: 20px; }
+      .url-box {
+        margin-top: 8px; padding: 12px; border-radius: 10px;
+        background: #0b1220; border: 1px solid #1f2937;
+        word-break: break-all; font-family: ui-monospace, monospace; font-size: 13px;
+      }
+      a { color: #60a5fa; }
+      .err { color: #f87171; }
+      video { width: 100%; margin-top: 16px; border-radius: 10px; background: #000; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>YouTube Stream Resolver</h1>
+      <p class="sub">Video ID を入力すると yt-dlp で googlevideo の直リンクを取得します。</p>
+      <form id="f" class="row">
+        <input id="id" placeholder="例: dQw4w9WgXcQ" autocomplete="off" required />
+        <button id="go" type="submit">取得</button>
+      </form>
+      <div class="result" id="result"></div>
+    </div>
+    <script>
+      const f = document.getElementById("f");
+      const idEl = document.getElementById("id");
+      const go = document.getElementById("go");
+      const result = document.getElementById("result");
+
+      f.addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const id = idEl.value.trim();
+        result.innerHTML = "";
+        go.disabled = true; go.textContent = "取得中…";
+        try {
+          const r = await fetch(`/api/video/${encodeURIComponent(id)}`);
+          const j = await r.json();
+          if (!r.ok) throw new Error(j.error || "failed");
+          result.innerHTML = `
+            <div>Stream URL:</div>
+            <div class="url-box"><a href="${j.url}" target="_blank" rel="noreferrer">${j.url}</a></div>
+            <video src="${j.url}" controls></video>
+          `;
+        } catch (err) {
+          result.innerHTML = `<div class="url-box err">${err.message}</div>`;
+        } finally {
+          go.disabled = false; go.textContent = "取得";
+        }
+      });
+    </script>
+  </body>
+</html>
