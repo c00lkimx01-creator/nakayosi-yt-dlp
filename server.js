@@ -3,16 +3,15 @@ import compression from "compression";
 import { spawn } from "child_process";
 import path from "path";
 import fs from "fs";
+import os from "os";
 import { fileURLToPath } from "url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// gzip + 静的ファイルキャッシュで配信を高速化
 app.use(compression());
 app.use((req, res, next) => {
-  // CORS（フロントから直接呼べるように）
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
   next();
@@ -24,13 +23,111 @@ app.use(
   })
 );
 
-// cookie.txt があれば使う。無くてもOK
-const COOKIE_PATH = path.join(__dirname, "cookie.txt");
-const hasCookie = fs.existsSync(COOKIE_PATH);
+// =========================================================
+// Cookie 自動取得：YouTube に HEAD/GET して Set-Cookie を保存
+// cookie.txt が手動配置されていればそれを優先
+// =========================================================
+const MANUAL_COOKIE = path.join(__dirname, "cookie.txt");
+const AUTO_COOKIE = path.join(os.tmpdir(), "yt_auto_cookies.txt");
+let cookiePath = null;
+let cookieExpires = 0;
+const COOKIE_TTL_MS = 30 * 60 * 1000; // 30 分
 
-// 簡易メモリキャッシュ（TTL 5 分）
+function writeNetscapeCookies(setCookieHeaders, file) {
+  const lines = [
+    "# Netscape HTTP Cookie File",
+    "# Auto-generated",
+  ];
+  const now = Math.floor(Date.now() / 1000);
+  const expires = now + 60 * 60 * 24 * 180; // 180 日
+  for (const raw of setCookieHeaders) {
+    // 例: "VISITOR_INFO1_LIVE=abc; Path=/; Domain=.youtube.com; ..."
+    const parts = raw.split(";").map((s) => s.trim());
+    const [nameVal, ...attrs] = parts;
+    const eq = nameVal.indexOf("=");
+    if (eq < 0) continue;
+    const name = nameVal.slice(0, eq);
+    const value = nameVal.slice(eq + 1);
+    let domain = ".youtube.com";
+    let cookiePathAttr = "/";
+    for (const a of attrs) {
+      const [k, v] = a.split("=");
+      if (!k) continue;
+      if (k.toLowerCase() === "domain" && v) domain = v.startsWith(".") ? v : "." + v;
+      if (k.toLowerCase() === "path" && v) cookiePathAttr = v;
+    }
+    lines.push(
+      [domain, "TRUE", cookiePathAttr, "FALSE", expires, name, value].join("\t")
+    );
+  }
+  // CONSENT を念のため付与（EU 同意ダイアログ回避）
+  lines.push([".youtube.com", "TRUE", "/", "FALSE", expires, "CONSENT", "YES+1"].join("\t"));
+  lines.push([".youtube.com", "TRUE", "/", "FALSE", expires, "SOCS", "CAI"].join("\t"));
+  fs.writeFileSync(file, lines.join("\n") + "\n");
+}
+
+async function refreshCookies() {
+  // 手動 cookie が置いてあれば常にそれを使う
+  if (fs.existsSync(MANUAL_COOKIE)) {
+    cookiePath = MANUAL_COOKIE;
+    cookieExpires = Date.now() + COOKIE_TTL_MS;
+    return cookiePath;
+  }
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 8000);
+    const r = await fetch("https://www.youtube.com/", {
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+      },
+      signal: ctrl.signal,
+      redirect: "follow",
+    });
+    clearTimeout(t);
+    // 複数 Set-Cookie を取得
+    let setCookies = [];
+    if (typeof r.headers.getSetCookie === "function") {
+      setCookies = r.headers.getSetCookie();
+    } else {
+      const raw = r.headers.get("set-cookie");
+      if (raw) setCookies = raw.split(/,(?=[^;]+=)/);
+    }
+    if (setCookies.length > 0) {
+      writeNetscapeCookies(setCookies, AUTO_COOKIE);
+      cookiePath = AUTO_COOKIE;
+      cookieExpires = Date.now() + COOKIE_TTL_MS;
+      console.log(`auto cookies refreshed (${setCookies.length})`);
+      return cookiePath;
+    }
+  } catch (e) {
+    console.error("cookie refresh failed:", e?.message || e);
+  }
+  // 失敗しても最低限の CONSENT クッキーだけ作る
+  try {
+    writeNetscapeCookies([], AUTO_COOKIE);
+    cookiePath = AUTO_COOKIE;
+    cookieExpires = Date.now() + COOKIE_TTL_MS;
+  } catch {}
+  return cookiePath;
+}
+
+async function ensureCookies() {
+  if (cookiePath && Date.now() < cookieExpires && fs.existsSync(cookiePath)) {
+    return cookiePath;
+  }
+  return await refreshCookies();
+}
+
+// 起動時に 1 回取得（失敗してもサーバーは動かす）
+refreshCookies().catch(() => {});
+
+// =========================================================
+// 結果キャッシュと in-flight 共有
+// =========================================================
 const CACHE_TTL_MS = 5 * 60 * 1000;
-const cache = new Map(); // id -> { url, expires }
+const cache = new Map();
 function getCache(id) {
   const v = cache.get(id);
   if (!v) return null;
@@ -43,15 +140,17 @@ function getCache(id) {
 function setCache(id, url) {
   cache.set(id, { url, expires: Date.now() + CACHE_TTL_MS });
 }
+const inflight = new Map();
 
-// 進行中のリクエストを束ねる（同じ id が同時に来ても yt-dlp は 1 回だけ）
-const inflight = new Map(); // id -> Promise
-
-// yt-dlp を 1 回試行。失敗しても throw しない
-function tryYtDlp(extraArgs, timeoutMs = 12000) {
+// =========================================================
+// yt-dlp 実行
+// =========================================================
+function tryYtDlp(extraArgs, timeoutMs = 15000) {
   return new Promise((resolve) => {
     const args = [...extraArgs];
-    if (hasCookie) args.unshift("--cookies", COOKIE_PATH);
+    if (cookiePath && fs.existsSync(cookiePath)) {
+      args.unshift("--cookies", cookiePath);
+    }
     let yt;
     try {
       yt = spawn("yt-dlp", args);
@@ -78,19 +177,32 @@ function tryYtDlp(extraArgs, timeoutMs = 12000) {
       clearTimeout(timer);
       const url = out.trim().split("\n").filter(Boolean)[0];
       if (code === 0 && url && /^https?:\/\//.test(url)) done({ ok: true, url });
-      else done({ ok: false, err: err.trim() || `exit ${code}` });
+      else done({ ok: false, err: err.trim().slice(0, 300) || `exit ${code}` });
     });
   });
 }
 
-// 速い client から並列に試して、最初に成功したものを使う
 async function getStreamUrl(videoId) {
+  await ensureCookies();
   const url = `https://www.youtube.com/watch?v=${videoId}`;
-  const base = ["-g", "-f", "best", "--no-warnings", "--no-playlist", "--socket-timeout", "10"];
-  const clients = ["android", "ios", "web_safari", "tv_embedded"];
+  const base = [
+    "-g",
+    "-f",
+    "best",
+    "--no-warnings",
+    "--no-playlist",
+    "--socket-timeout",
+    "10",
+    "--user-agent",
+    "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36",
+  ];
+  const clients = ["android", "ios", "web_safari", "tv_embedded", "mweb"];
 
   const attempts = clients.map((c) =>
-    tryYtDlp([...base, "--extractor-args", `youtube:player_client=${c}`, url], 12000)
+    tryYtDlp(
+      [...base, "--extractor-args", `youtube:player_client=${c}`, url],
+      15000
+    )
   );
 
   return await new Promise((resolve) => {
@@ -113,7 +225,6 @@ async function getStreamUrl(videoId) {
 
 app.get("/api/video/:id", async (req, res) => {
   const { id } = req.params;
-  // キャッシュ用ヘッダ
   res.setHeader("Cache-Control", "public, max-age=120");
 
   if (!/^[\w-]{6,20}$/.test(id)) {
@@ -134,19 +245,19 @@ app.get("/api/video/:id", async (req, res) => {
       setCache(id, r.url);
       return res.status(200).json({ id, url: r.url });
     }
+    // 失敗時は cookie を強制リフレッシュして次回に備える
+    refreshCookies().catch(() => {});
     return res.status(200).json({ id, url: null, error: r.error });
   } catch (e) {
     return res.status(200).json({ id, url: null, error: String(e?.message || e) });
   }
 });
 
-// ヘルスチェック
-app.get("/healthz", (_req, res) => res.status(200).json({ ok: true }));
+app.get("/healthz", (_req, res) =>
+  res.status(200).json({ ok: true, cookie: cookiePath ? path.basename(cookiePath) : null })
+);
 
-// 想定外の例外でプロセスが死なないように
 process.on("uncaughtException", (e) => console.error("uncaughtException:", e));
 process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e));
 
-app.listen(PORT, () =>
-  console.log(`listening on ${PORT} (cookie: ${hasCookie ? "yes" : "no"})`)
-);
+app.listen(PORT, () => console.log(`listening on ${PORT}`));
